@@ -3,9 +3,13 @@ from typing import List
 
 import torch
 
+from lightglue_onnx.aliked.aliked import ALIKED
 from lightglue_onnx import DISK, LightGlue, LightGlueEnd2End, SuperPoint
 from lightglue_onnx.end2end import normalize_keypoints
 from lightglue_onnx.utils import load_image, rgb_to_grayscale
+
+from lightglue_onnx.aliked import deform_conv2d_onnx_exporter
+deform_conv2d_onnx_exporter.register_deform_conv2d_onnx_op()
 
 
 def parse_args() -> argparse.Namespace:
@@ -14,17 +18,24 @@ def parse_args() -> argparse.Namespace:
         "--img_size",
         nargs="+",
         type=int,
-        default=512,
+        default=[1280, 720],
         required=False,
         help="Sample image size for ONNX tracing. If a single integer is given, resize the longer side of the image to this value. Otherwise, please provide two integers (height width).",
     )
     parser.add_argument(
         "--extractor_type",
         type=str,
-        default="superpoint",
-        choices=["superpoint", "disk"],
+        default="aliked",
+        choices=["superpoint", "disk", "aliked"],
         required=False,
         help="Type of feature extractor. Supported extractors are 'superpoint' and 'disk'. Defaults to 'superpoint'.",
+    )
+    parser.add_argument(
+        "--aliked_model",
+        type=str,
+        default="aliked-n16",
+        required=False,
+        help="The model for aliked extractor.",
     )
     parser.add_argument(
         "--extractor_path",
@@ -53,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max_num_keypoints",
         type=int,
-        default=None,
+        default=2048,
         required=False,
         help="Maximum number of keypoints outputted by the extractor.",
     )
@@ -62,19 +73,32 @@ def parse_args() -> argparse.Namespace:
 
 
 def export_onnx(
-    img_size=512,
-    extractor_type="superpoint",
+    img_size=[1280, 1024],
+    extractor_type="aliked",
+    aliked_model="aliked-n16",
     extractor_path=None,
     lightglue_path=None,
-    img0_path="assets/sacre_coeur1.jpg",
-    img1_path="assets/sacre_coeur2.jpg",
+    img0_path="/mnt/disk2/sfm-playground/temp461.jpg",
+    img1_path="/mnt/disk2/sfm-playground/temp463.jpg",
     end2end=False,
-    dynamic=False,
-    max_num_keypoints=None,
+    dynamic=True,
+    max_num_keypoints=2048,
 ):
     # Handle args
     if isinstance(img_size, List) and len(img_size) == 1:
         img_size = img_size[0]
+
+    # Handle aliked desc dim
+    aliked_desc_dim: dict[str, int] = {
+        "aliked-t16": 64,
+        "aliked-n16": 128,
+        "aliked-n16rot": 128,
+        "aliked-n32": 128,
+    }
+    if extractor_type == "aliked" and aliked_model not in aliked_desc_dim:
+        raise ValueError(
+            "The specified aliked model not found. Choose one from -> "
+            "aliked-t16, aliked-n16, aliked-n16rot, or aliked-n32")
 
     if extractor_path is not None and end2end:
         raise ValueError(
@@ -84,7 +108,7 @@ def export_onnx(
         extractor_path = f"weights/{extractor_type}.onnx"
         if max_num_keypoints is not None:
             extractor_path = extractor_path.replace(
-                ".onnx", f"_{max_num_keypoints}.onnx"
+                ".onnx", f"_{max_num_keypoints}_1024h.onnx"
             )
 
     if lightglue_path is None:
@@ -95,8 +119,8 @@ def export_onnx(
         )
 
     # Sample images for tracing
-    image0, scales0 = load_image(img0_path, resize=img_size)
-    image1, scales1 = load_image(img1_path, resize=img_size)
+    image0, scales0 = load_image(img0_path, resize=[1024, 1280])
+    image1, scales1 = load_image(img1_path, resize=[1024, 1280])
     # Models
     extractor_type = extractor_type.lower()
     if extractor_type == "superpoint":
@@ -108,6 +132,15 @@ def export_onnx(
     elif extractor_type == "disk":
         extractor = DISK(max_num_keypoints=max_num_keypoints).eval()
         lightglue = LightGlue(extractor_type).eval()
+    elif extractor_type == "aliked":
+        # image0 = image0.cuda()
+        # image1 = image1.cuda()
+        extractor = ALIKED(
+            model_name=aliked_model,
+            device="cpu",
+            top_k=max_num_keypoints
+        )
+        lightglue = LightGlue(aliked_model).eval()
     else:
         raise NotImplementedError(
             f"LightGlue has not been trained on {extractor_type} features."
@@ -161,16 +194,16 @@ def export_onnx(
             extractor_path = extractor_path.replace(
                 ".onnx", f"_{image0.shape[-2]}x{image0.shape[-1]}.onnx"
             )
-
-        torch.onnx.export(
-            extractor,
-            image0[None],
-            extractor_path,
-            input_names=["image"],
-            output_names=["keypoints", "scores", "descriptors"],
-            opset_version=17,
-            dynamic_axes=dynamic_axes,
-        )
+        with torch.device("cpu"):
+            torch.onnx.export(
+                extractor,
+                image0[None],
+                extractor_path,
+                input_names=["image"],
+                output_names=["keypoints", "scores", "descriptors"],
+                opset_version=22,
+                dynamic_axes=dynamic_axes
+            )
 
         # Export LightGlue
         feats0, feats1 = extractor(image0[None]), extractor(image1[None])
@@ -179,22 +212,26 @@ def export_onnx(
 
         kpts0 = normalize_keypoints(kpts0, image0.shape[1], image0.shape[2])
         kpts1 = normalize_keypoints(kpts1, image1.shape[1], image1.shape[2])
+        image_size = torch.Tensor([image0.shape[1], image0.shape[2]], device=kpts0.device)
 
-        torch.onnx.export(
-            lightglue,
-            (kpts0, kpts1, desc0, desc1),
-            lightglue_path,
-            input_names=["kpts0", "kpts1", "desc0", "desc1"],
-            output_names=["matches0", "mscores0"],
-            opset_version=17,
-            dynamic_axes={
-                "kpts0": {1: "num_keypoints0"},
-                "kpts1": {1: "num_keypoints1"},
-                "desc0": {1: "num_keypoints0"},
-                "desc1": {1: "num_keypoints1"},
-                "matches0": {0: "num_matches0"},
-                "mscores0": {0: "num_matches0"},
-            },
+        matches, mscores = lightglue(kpts0, kpts1, desc0, desc1, image_size)
+
+        with torch.device("cpu"):
+            torch.onnx.export(
+                lightglue,
+                (kpts0, kpts1, desc0, desc1, image_size),
+                lightglue_path,
+                input_names=["kpts0", "kpts1", "desc0", "desc1", "image_size"],
+                output_names=["matches0", "mscores0"],
+                opset_version=22,
+                dynamic_axes={
+                    "kpts0": {1: "num_keypoints0"},
+                    "kpts1": {1: "num_keypoints1"},
+                    "desc0": {1: "num_keypoints0"},
+                    "desc1": {1: "num_keypoints1"},
+                    "matches0": {0: "num_matches0"},
+                    "mscores0": {0: "num_matches0"},
+                }
         )
 
 

@@ -141,7 +141,8 @@ class CrossBlock(nn.Module):
         m1 = self.inner_attn(qk1, qk0, v0)
 
         m0, m1 = map(
-            lambda t: t.transpose(1, 2).reshape(self.batch, -1, self.embed_dim),
+            lambda t: t.transpose(1, 2).reshape(
+                self.batch, -1, self.embed_dim),
             (m0, m1),
         )
         m0, m1 = map(self.to_out, (m0, m1))
@@ -175,7 +176,13 @@ def sigmoid_log_double_softmax(
     certainties = F.logsigmoid(z0) + F.logsigmoid(z1).transpose(1, 2)
     scores0 = F.log_softmax(sim, 2)
     scores1 = F.log_softmax(sim, 1)
-    scores = scores0 + scores1 + certainties
+    # scores = scores0 + scores1 + certainties
+    b, m, n = sim.shape
+    scores = sim.new_full((b, m + 1, n + 1), 0)
+    scores[:, :m, :n] = scores0 + scores1 + certainties
+    scores[:, :-1, -1] = F.logsigmoid(-z0.squeeze(-1))
+    scores[:, -1, :-1] = F.logsigmoid(-z1.squeeze(-1))
+
     return scores
 
 
@@ -203,22 +210,21 @@ class MatchAssignment(nn.Module):
 
 def filter_matches(scores: torch.Tensor, th: float):
     """obtain matches from a log assignment matrix [BxMxN]"""
-    max0 = torch.topk(scores, k=1, dim=2, sorted=False)  # scores.max(2)
-    max1 = torch.topk(scores, k=1, dim=1, sorted=False)  # scores.max(1)
-    m0, m1 = max0.indices[:, :, 0], max1.indices[:, 0, :]
+    max0, max1 = scores[:, :-1, :-1].max(2), scores[:, :-1, :-1].max(1)
+    m0, m1 = max0.indices, max1.indices
     indices0 = torch.arange(m0.shape[1], device=m0.device)[None]
-    # indices1 = torch.arange(m1.shape[1], device=m1.device)[None]
+    indices1 = torch.arange(m1.shape[1], device=m1.device)[None]
     mutual0 = indices0 == m1.gather(1, m0)
-    # mutual1 = indices1 == m0.gather(1, m1)
-    max0_exp = max0.values[:, :, 0].exp()
+    mutual1 = indices1 == m0.gather(1, m1)
+    max0_exp = max0.values.exp()
     zero = max0_exp.new_tensor(0)
     mscores0 = torch.where(mutual0, max0_exp, zero)
-    # mscores1 = torch.where(mutual1, mscores0.gather(1, m1), zero)
-    valid0 = mscores0 > th
-    # valid1 = mutual1 & valid0.gather(1, m1)
-    # m0 = torch.where(valid0, m0, -1)
-    # m1 = torch.where(valid1, m1, -1)
-    # return m0, m1, mscores0, mscores1
+    mscores1 = torch.where(mutual1, mscores0.gather(1, m1), zero)
+    valid0 = mutual0 & (mscores0 > th)
+    valid1 = mutual1 & valid0.gather(1, m1)
+    m0 = torch.where(valid0, m0, -1)
+    m1 = torch.where(valid1, m1, -1)
+    return m0, m1, mscores0, mscores1
 
     m_indices_0 = indices0[valid0]
     m_indices_1 = m0[0][m_indices_0]
@@ -231,7 +237,8 @@ def filter_matches(scores: torch.Tensor, th: float):
 class LightGlue(nn.Module):
     default_conf = {
         "name": "lightglue",  # just for interfacing
-        "input_dim": 256,  # input descriptor dimension (autoselected from weights)
+        # input descriptor dimension (autoselected from weights)
+        "input_dim": 256,
         "descriptor_dim": 256,
         "n_layers": 9,
         "num_heads": 4,
@@ -247,6 +254,10 @@ class LightGlue(nn.Module):
     features = {
         "superpoint": ("superpoint_lightglue", 256),
         "disk": ("disk_lightglue", 128),
+        "aliked-t16": ("aliked_lightglue", 64),
+        "aliked-n16": ("aliked_lightglue", 128),
+        "aliked-n16rot": ("aliked_lightglue", 128),
+        "aliked-n32": ("aliked_lightglue", 128),
     }
 
     def __init__(self, features="superpoint", **conf) -> None:
@@ -258,7 +269,8 @@ class LightGlue(nn.Module):
         self.conf = conf = SimpleNamespace(**self.conf)
 
         if conf.input_dim != conf.descriptor_dim:
-            self.input_proj = nn.Linear(conf.input_dim, conf.descriptor_dim, bias=True)
+            self.input_proj = nn.Linear(
+                conf.input_dim, conf.descriptor_dim, bias=True)
         else:
             self.input_proj = nn.Identity()
 
@@ -267,9 +279,11 @@ class LightGlue(nn.Module):
 
         h, n, d = conf.num_heads, conf.n_layers, conf.descriptor_dim
 
-        self.transformers = nn.ModuleList([TransformerLayer(d, h) for _ in range(n)])
+        self.transformers = nn.ModuleList(
+            [TransformerLayer(d, h) for _ in range(n)])
 
-        self.log_assignment = nn.ModuleList([MatchAssignment(d) for _ in range(n)])
+        self.log_assignment = nn.ModuleList(
+            [MatchAssignment(d) for _ in range(n)])
 
         self.token_confidence = nn.ModuleList(
             [TokenConfidence(d) for _ in range(n - 1)]
@@ -283,7 +297,7 @@ class LightGlue(nn.Module):
         if features is not None:
             fname = f"{conf.weights}_{self.version}.pth".replace(".", "-")
             state_dict = torch.hub.load_state_dict_from_url(
-                self.url.format(self.version, features), file_name=fname
+                self.url.format(self.version, features.split('-')[0]), file_name=fname
             )
         elif conf.weights is not None:
             path = Path(__file__).parent
@@ -294,9 +308,11 @@ class LightGlue(nn.Module):
             # rename old state dict entries
             for i in range(n):
                 pattern = f"self_attn.{i}", f"transformers.{i}.self_attn"
-                state_dict = {k.replace(*pattern): v for k, v in state_dict.items()}
+                state_dict = {k.replace(*pattern): v for k,
+                              v in state_dict.items()}
                 pattern = f"cross_attn.{i}", f"transformers.{i}.cross_attn"
-                state_dict = {k.replace(*pattern): v for k, v in state_dict.items()}
+                state_dict = {k.replace(*pattern): v for k,
+                              v in state_dict.items()}
             self.load_state_dict(state_dict, strict=False)
 
         print("Loaded LightGlue model")
@@ -307,9 +323,15 @@ class LightGlue(nn.Module):
         kpts1: torch.Tensor,
         desc0: torch.Tensor,
         desc1: torch.Tensor,
+        image_size: torch.Tensor,
     ):
         b, m, _ = kpts0.shape
         b, n, _ = kpts1.shape
+
+        shift = image_size / 2
+        scale = image_size.max() / 2
+        kpts0 = (kpts0 - shift) / scale
+        kpts1 = (kpts1 - shift) / scale
 
         desc0 = self.input_proj(desc0)
         desc1 = self.input_proj(desc1)
@@ -327,7 +349,8 @@ class LightGlue(nn.Module):
 
         for i in range(self.conf.n_layers):
             # self+cross attention
-            desc0, desc1 = self.transformers[i](desc0, desc1, encoding0, encoding1)
+            desc0, desc1 = self.transformers[i](
+                desc0, desc1, encoding0, encoding1)
             if i == self.conf.n_layers - 1:
                 continue  # no early stopping or adaptive width at last layer
 
@@ -338,26 +361,45 @@ class LightGlue(nn.Module):
                     break
 
             if do_point_pruning:  # point pruning
-                scores0 = self.log_assignment[i].get_matchability(desc0)
-                prunemask0 = self.get_pruning_mask(token0, scores0, i)
-                keep0 = torch.where(prunemask0)[1]
-                ind0 = ind0.index_select(1, keep0)
-                desc0 = desc0.index_select(1, keep0)
-                encoding0 = encoding0.index_select(-2, keep0)
+                if desc0.shape[-2] > -1:
+                    scores0 = self.log_assignment[i].get_matchability(desc0)
+                    prunemask0 = self.get_pruning_mask(token0, scores0, i)
+                    keep0 = torch.where(prunemask0)[1]
+                    ind0 = ind0.index_select(1, keep0)
+                    desc0 = desc0.index_select(1, keep0)
+                    encoding0 = encoding0.index_select(-2, keep0)
 
-                scores1 = self.log_assignment[i].get_matchability(desc1)
-                prunemask1 = self.get_pruning_mask(token1, scores1, i)
-                keep1 = torch.where(prunemask1)[1]
-                ind1 = ind1.index_select(1, keep1)
-                desc1 = desc1.index_select(1, keep1)
-                encoding1 = encoding1.index_select(-2, keep1)
+                if desc1.shape[-2] > -1:
+                    scores1 = self.log_assignment[i].get_matchability(desc1)
+                    prunemask1 = self.get_pruning_mask(token1, scores1, i)
+                    keep1 = torch.where(prunemask1)[1]
+                    ind1 = ind1.index_select(1, keep1)
+                    desc1 = desc1.index_select(1, keep1)
+                    encoding1 = encoding1.index_select(-2, keep1)
 
-        # desc0, desc1 = desc0[..., :m, :], desc1[..., :n, :]
+        desc0, desc1 = desc0[..., :m, :], desc1[..., :n, :]
         scores = self.log_assignment[i](desc0, desc1)
-        matches, mscores = filter_matches(scores, self.conf.filter_threshold)
+        m0, m1, mscores0, mscores1 = filter_matches(scores, self.conf.filter_threshold)
+        matches, mscores = [], []
+        for k in range(b):
+            valid = m0[k] > -1
+            m_indices_0 = torch.nonzero((m0[k] + 1).to(torch.int32)).flatten()
+            m_indices_1 = m0[k][m_indices_0]
+            if do_point_pruning:
+                m_indices_0 = ind0[k, m_indices_0]
+                m_indices_1 = ind1[k, m_indices_1]
+            matches.append(torch.stack([m_indices_0, m_indices_1], -1))
+            mscores.append(mscores0[k][m_indices_0])
+
+        # reorder matches by score, largest first, assume batch size is 1
+        # indices = torch.argsort(torch.cat(mscores, dim=0), descending=True)
+        # matches = torch.cat(matches, dim=0)[indices]
+        # mscores = torch.cat(mscores, dim=0)[indices]
+
         return matches, mscores
         # Skip unnecessary computation
-        m0, m1, mscores0, mscores1 = filter_matches(scores, self.conf.filter_threshold)
+        m0, m1, mscores0, mscores1 = filter_matches(
+            scores, self.conf.filter_threshold)
 
         valid = m0[0] > -1
         m_indices_0 = torch.where(valid)[0]
@@ -372,8 +414,10 @@ class LightGlue(nn.Module):
         if do_point_pruning:  # scatter with indices after pruning
             m0_ = torch.full((b, m), -1, device=m0.device, dtype=m0.dtype)
             m1_ = torch.full((b, n), -1, device=m1.device, dtype=m1.dtype)
-            m0_[:, ind0] = torch.where(m0 == -1, -1, ind1.gather(1, m0.clamp(min=0)))
-            m1_[:, ind1] = torch.where(m1 == -1, -1, ind0.gather(1, m1.clamp(min=0)))
+            m0_[:, ind0] = torch.where(
+                m0 == -1, -1, ind1.gather(1, m0.clamp(min=0)))
+            m1_[:, ind1] = torch.where(
+                m1 == -1, -1, ind0.gather(1, m1.clamp(min=0)))
             mscores0_ = torch.zeros((b, m), device=mscores0.device)
             mscores1_ = torch.zeros((b, n), device=mscores1.device)
             mscores0_[:, ind0] = mscores0
@@ -409,5 +453,6 @@ class LightGlue(nn.Module):
         """evaluate stopping condition"""
         confidences = torch.cat([confidences0, confidences1], -1)
         threshold = self.confidence_thresholds[layer_index]
-        ratio_confident = 1.0 - (confidences < threshold).float().sum() / num_points
+        ratio_confident = 1.0 - \
+            (confidences < threshold).float().sum() / num_points
         return ratio_confident > self.conf.depth_confidence
