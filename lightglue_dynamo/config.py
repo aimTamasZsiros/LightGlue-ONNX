@@ -12,6 +12,7 @@ class InferenceDevice(StrEnum):
 class Extractor(StrEnum):
     superpoint = auto()
     disk = auto()
+    aliked = auto()
 
     @property
     def input_dim_divisor(self) -> int:
@@ -20,6 +21,8 @@ class Extractor(StrEnum):
                 return 8
             case Extractor.disk:
                 return 16
+            case Extractor.aliked:
+                return 16
 
     @property
     def input_channels(self) -> int:
@@ -27,6 +30,8 @@ class Extractor(StrEnum):
             case Extractor.superpoint:
                 return 1
             case Extractor.disk:
+                return 3
+            case Extractor.aliked:
                 return 3
 
     @property
@@ -38,4 +43,9 @@ class Extractor(StrEnum):
                 return {
                     "input_dim": 128,
                     "url": "https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/disk_lightglue.pth",
+                }
+            case Extractor.aliked:
+                return {
+                    "input_dim": 128,
+                    "url": "https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/aliked_lightglue.pth"
                 }
