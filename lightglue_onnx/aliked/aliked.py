@@ -148,9 +148,9 @@ class ALIKED(nn.Module):
 
         # load pretrained
         if load_pretrained:
-            url = f"/home/ad.adasworks.com/tamas.zsiros/Downloads/aliked-n16.pth"
+            url = f"https://raw.githubusercontent.com/ajuric/aliked-tensorrt/main/models/{model_name}.pth"
             print(f"loading {url}")
-            state_dict = torch.load("/home/ad.adasworks.com/tamas.zsiros/Downloads/aliked-n16.pth")
+            state_dict = torch.load(url)
             self.load_state_dict(state_dict, strict=True)
             self.to(device)
             self.eval()
